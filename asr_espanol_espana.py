@@ -1056,6 +1056,20 @@ def train_epoch(
         if use_spec_augment:
             features = spec_augment(features)
 
+        if idx == 0:
+            log.info(
+                f"DEBUG - Batch shapes: features={tuple(features.shape)}, "
+                f"targets={tuple(targets.shape)}"
+            )
+            log.info(
+                f"DEBUG - Feature stats: min={features.min():.3f}, "
+                f"max={features.max():.3f}, mean={features.mean():.3f}"
+            )
+            log.info(
+                f"DEBUG - Target sample (primeros 20 IDs): "
+                f"{targets[0, :20].tolist()}"
+            )
+
         optimizer.zero_grad()
         loss, metrics = model.compute_loss(features, targets, feat_lengths, tgt_lengths)
 
@@ -1310,6 +1324,38 @@ def download_rtve2022(data_dir: str = "data/rtve2022") -> Optional[str]:
     return None
 
 
+def _verify_data_downloads(data_dir: str) -> Dict[str, bool]:
+    """Verifica que los datasets se hayan descargado correctamente."""
+    status: Dict[str, bool] = {"common_voice": False, "rtve2022": False}
+
+    # Verificar Common Voice (caché HuggingFace)
+    cv_cache = pathlib.Path(data_dir) / "common_voice" / "hf_cache"
+    if cv_cache.exists() and any(cv_cache.iterdir()):
+        status["common_voice"] = True
+        log.info(f"✓ Common Voice ES: caché encontrado en {cv_cache}")
+    else:
+        log.warning(f"✗ Common Voice ES: caché NO encontrado en {cv_cache}")
+
+    # Verificar RTVE 2022 (archivo centinela o caché HuggingFace)
+    rtve_dir = pathlib.Path(data_dir) / "rtve2022"
+    rtve_done = rtve_dir / ".downloaded"
+    rtve_cache = rtve_dir / "hf_cache"
+    if rtve_done.exists():
+        try:
+            source = rtve_done.read_text().strip() or "desconocido"
+        except OSError:
+            source = "desconocido"
+        status["rtve2022"] = True
+        log.info(f"✓ RTVE 2022: descargado desde '{source}' en {rtve_dir}")
+    elif rtve_cache.exists() and any(rtve_cache.iterdir()):
+        status["rtve2022"] = True
+        log.info(f"✓ RTVE 2022: caché HuggingFace encontrado en {rtve_cache}")
+    else:
+        log.warning(f"✗ RTVE 2022: datos NO encontrados en {rtve_dir}")
+
+    return status
+
+
 def load_rtve2022_hf(data_dir: str = "data/rtve2022") -> Optional[Any]:
     """Carga el dataset RTVE 2022 si ya está en caché de HuggingFace."""
     try:
@@ -1466,11 +1512,15 @@ def build_dataloaders(
     # ── Common Voice ES ────────────────────────────────────────────────────
     cv = download_common_voice_spain(f"{data_dir}/common_voice")
     if cv is not None:
+        cv_before = len(all_samples)
         for split in ("train", "validation", "test"):
             ss = _hf_to_samples(cv, split, "common_voice")
             all_samples.extend(ss)
             corpus_texts.extend(s["sentence"] for s in ss)
-        log.info(f"Common Voice: {len(all_samples):,} muestras cargadas")
+            log.info(f"  Common Voice '{split}': {len(ss):,} muestras")
+        log.info(f"Common Voice: {len(all_samples) - cv_before:,} muestras cargadas")
+    else:
+        log.warning("Common Voice ES no disponible; se omite esta fuente de datos.")
 
     # ── RTVE 2022 ──────────────────────────────────────────────────────────
     rtve_dir = download_rtve2022(f"{data_dir}/rtve2022")
@@ -1482,7 +1532,12 @@ def build_dataloaders(
                 ss = _hf_to_samples(rtve, split, "rtve2022")
                 all_samples.extend(ss)
                 corpus_texts.extend(s["sentence"] for s in ss)
+                log.info(f"  RTVE 2022 '{split}': {len(ss):,} muestras")
             log.info(f"RTVE 2022: {len(all_samples) - before:,} muestras cargadas")
+        else:
+            log.warning("RTVE 2022 descargado pero no se pudo cargar como dataset HuggingFace.")
+    else:
+        log.warning("RTVE 2022 no disponible; se omite esta fuente de datos.")
 
     # ── Dataset sintético de respaldo ──────────────────────────────────────
     if not all_samples:
@@ -1899,6 +1954,8 @@ def main() -> None:
 
     # ── Fase 6: Datasets ───────────────────────────────────────────────────
     log.info("\n[FASE 6] Descargando y preparando datasets...")
+    log.info("\n=== DIAGNÓSTICO DE DATOS ===")
+    _verify_data_downloads(args.data_dir)
     train_loader, val_loader, corpus_texts = build_dataloaders(
         tokenizer=tokenizer,
         audio_frontend=audio_frontend,
@@ -1918,6 +1975,17 @@ def main() -> None:
 
     vocab_size = tokenizer.vocab_size_real()
     log.info(f"Vocabulario real: {vocab_size} tokens")
+
+    # ── Validar tokenizer ──────────────────────────────────────────────────
+    if tokenizer.sp is None:
+        log.error("El tokenizer no se inicializó correctamente. Verifica los textos del corpus.")
+        sys.exit(1)
+    try:
+        _test_ids = tokenizer.encode("hola mundo", add_sos=True, add_eos=True)
+        log.info(f"✓ Tokenizer OK — 'hola mundo' → {len(_test_ids)} tokens")
+    except Exception as _tok_exc:
+        log.error(f"El tokenizer no puede codificar texto: {_tok_exc}")
+        sys.exit(1)
 
     # ── Fase 2 + 4: Modelo ASSR ───────────────────────────────────────────
     log.info("\n[FASE 2+4] Construyendo modelo ASSR Conformer...")
@@ -1975,6 +2043,24 @@ def main() -> None:
         return
 
     # ── Fase 5: Entrenamiento ─────────────────────────────────────────────
+    # Validar features de audio con el primer batch antes de entrenar
+    log.info("\n[FASE 5] Validando features de audio...")
+    try:
+        _feat_batch, _tgt_batch, _feat_len, _tgt_len = next(iter(train_loader))
+        log.info(
+            f"✓ Audio features — shape={tuple(_feat_batch.shape)}, "
+            f"min={_feat_batch.min():.3f}, max={_feat_batch.max():.3f}, "
+            f"mean={_feat_batch.mean():.3f}"
+        )
+        if torch.isnan(_feat_batch).any() or torch.isinf(_feat_batch).any():
+            log.error("Se detectaron NaN/Inf en las features de audio. "
+                      "Verifica VAD y normalización.")
+            sys.exit(1)
+        del _feat_batch, _tgt_batch, _feat_len, _tgt_len
+    except StopIteration:
+        log.error("El DataLoader de entrenamiento está vacío. Verifica la carga de datos.")
+        sys.exit(1)
+
     log.info("\n[FASE 5] Iniciando entrenamiento...")
     train(
         model=model,
