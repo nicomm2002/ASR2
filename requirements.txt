@@ -1,0 +1,32 @@
+# ==============================================================================
+# ASSR Español de España — Dependencias
+# ==============================================================================
+# Instalar con:
+#   pip install -r requirements.txt
+
+# ── Deep Learning ──────────────────────────────────────────────────────────────
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# ── Tokenización ──────────────────────────────────────────────────────────────
+sentencepiece>=0.1.99
+
+# ── Datasets (HuggingFace) ────────────────────────────────────────────────────
+datasets>=2.16.0
+huggingface-hub>=0.20.0
+
+# ── Evaluación ────────────────────────────────────────────────────────────────
+jiwer>=3.0.3
+
+# ── Utilidades ────────────────────────────────────────────────────────────────
+numpy>=1.24.0
+requests>=2.31.0
+tqdm>=4.66.0
+
+# ── Opcional: aceleración de decodificación con modelo de lenguaje KenLM ──────
+# pyctcdecode>=0.5.0    # beam search con KenLM
+# kenlm                 # instalar por separado: pip install https://github.com/kpu/kenlm/archive/master.zip
