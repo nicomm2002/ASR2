@@ -15,15 +15,16 @@ Arquitectura basada en:
   · Samba-ASR      (2025)
 
 Datos requeridos (locales):
-  /home/nmartinez-root/mi_entorno/data/common_voice/   (Common Voice ES)
-  /home/nmartinez-root/mi_entorno/data/voxpopuli/      (VoxPopuli ES)
+  /home/nmartinez-root/mi_entorno/data/common_voice_25/   (Common Voice ES)
+  /home/nmartinez-root/mi_entorno/data/dave1.0/           (DAVE 1.0 ES)
+  /home/nmartinez-root/mi_entorno/data/voxpopuli/         (VoxPopuli ES)
 
 Ejecución:
   pip install -r requirements.txt
   python asr_espanol_espana.py
 
 El script automatiza:
-  1. Carga de corpus Common Voice + VoxPopuli (local)
+  1. Carga de corpus Common Voice + DAVE + VoxPopuli (local)
   2. Filtrado de hablantes peninsulares
   3. Extracción de características de audio (Mel filterbank 80 filtros)
   4. Entrenamiento del tokenizer BPE (6000 tokens, español peninsular)
@@ -59,7 +60,8 @@ log = logging.getLogger("ASSR")
 
 # Rutas fijas de datos locales
 DATA_BASE = pathlib.Path("/home/nmartinez-root/mi_entorno/data")
-COMMON_VOICE_PATH = DATA_BASE / "common_voice"
+COMMON_VOICE_PATH = DATA_BASE / "common_voice_25"
+DAVE_PATH = DATA_BASE / "dave1.0"
 VOXPOPULI_PATH = DATA_BASE / "voxpopuli"
 
 # ==============================================================================
@@ -101,6 +103,11 @@ def _verify_local_data() -> None:
         log.error(f"✗ Common Voice NO encontrado en: {COMMON_VOICE_PATH}")
         sys.exit(1)
     log.info(f"✓ Common Voice encontrado en: {COMMON_VOICE_PATH}")
+
+    if not DAVE_PATH.exists():
+        log.error(f"✗ DAVE 1.0 NO encontrado en: {DAVE_PATH}")
+        sys.exit(1)
+    log.info(f"✓ DAVE 1.0 encontrado en: {DAVE_PATH}")
     
     if not VOXPOPULI_PATH.exists():
         log.error(f"✗ VoxPopuli NO encontrado en: {VOXPOPULI_PATH}")
@@ -1249,10 +1256,10 @@ def _is_peninsular(sample: Dict) -> bool:
 
 def load_local_datasets() -> Dict[str, Any]:
     """
-    Carga Common Voice ES y VoxPopuli ES desde rutas locales.
+    Carga Common Voice ES, DAVE 1.0 ES y VoxPopuli ES desde rutas locales.
     
     Returns:
-        Dict con keys "common_voice" y "voxpopuli", cada uno conteniendo
+        Dict con keys "common_voice", "dave" y "voxpopuli", cada uno conteniendo
         un dataset de HuggingFace con splits train/validation/test
     """
     from datasets import load_from_disk
@@ -1281,6 +1288,15 @@ def load_local_datasets() -> Dict[str, Any]:
             datasets_loaded["common_voice"] = cv_dataset
         except Exception as exc2:
             log.error(f"No se pudo cargar Common Voice: {exc2}")
+
+    # ── DAVE 1.0 ────────────────────────────────────────────────────────────
+    log.info(f"Cargando DAVE 1.0 ES desde: {DAVE_PATH}")
+    try:
+        dave_dataset = load_from_disk(str(DAVE_PATH))
+        log.info(f"✓ DAVE 1.0 cargado con splits: {list(dave_dataset.keys())}")
+        datasets_loaded["dave"] = dave_dataset
+    except Exception as exc:
+        log.error(f"No se pudo cargar DAVE 1.0: {exc}")
     
     # ── VoxPopuli ──────────────────────────────────────────────────────────
     log.info(f"Cargando VoxPopuli ES desde: {VOXPOPULI_PATH}")
@@ -1317,13 +1333,14 @@ def _hf_to_samples(hf_dataset: Any, split: str, source: str) -> List[Dict]:
     if hf_dataset is None or split not in hf_dataset:
         return samples
     for row in hf_dataset[split]:
-        # Common Voice: "sentence", VoxPopuli: "raw_text" o "text"
+        # Common Voice/DAVE/VoxPopuli: posibles nombres de campo de texto
         text = row.get("sentence") or row.get("raw_text") or row.get("text") or ""
         if not text.strip():
             continue
         samples.append({
             "audio": row.get("audio", {}),
             "sentence": text,
+            "accent": row.get("accent", ""),
             "source": source,
             "split": split,
         })
@@ -1371,6 +1388,16 @@ class SpanishASRDataset(torch.utils.data.Dataset):
         if isinstance(audio_field, dict) and audio_field.get("array") is not None:
             waveform = np.array(audio_field["array"], dtype=np.float32)
             sr = int(audio_field.get("sampling_rate", 16_000))
+        elif isinstance(audio_field, dict) and audio_field.get("path"):
+            audio_path = pathlib.Path(audio_field["path"])
+            if audio_path.exists():
+                features = self.frontend.process(str(audio_path))
+                text = sample.get("sentence") or sample.get("text") or ""
+                tokens = torch.tensor(
+                    self.tokenizer.encode(text, add_sos=True, add_eos=True),
+                    dtype=torch.long,
+                )
+                return features[: self.max_frames], tokens[: self.max_tokens]
         elif sample.get("array") is not None:
             waveform = np.array(sample["array"], dtype=np.float32)
             sr = int(sample.get("sampling_rate", 16_000))
@@ -1384,8 +1411,7 @@ class SpanishASRDataset(torch.utils.data.Dataset):
             return features[: self.max_frames], tokens[: self.max_tokens]
 
         if waveform is None or len(waveform) == 0:
-            # Muestra sintética de respaldo
-            waveform = np.zeros(16_000, dtype=np.float32)
+            raise ValueError("No se pudo cargar audio real para la muestra.")
 
         # Speed perturbation
         if self.speed_perturbation and random.random() < 0.67:
@@ -1441,7 +1467,7 @@ def build_dataloaders(
 ) -> Tuple["DataLoader", "DataLoader", List[str]]:
     """
     Construye los DataLoaders de entrenamiento y validación usando
-    Common Voice ES + VoxPopuli ES desde rutas locales.
+    Common Voice ES + DAVE 1.0 ES + VoxPopuli ES desde rutas locales.
 
     Devuelve también la lista de textos del corpus para entrenar el tokenizer.
     """
@@ -1477,30 +1503,20 @@ def build_dataloaders(
             corpus_texts.extend(s["sentence"] for s in ss_filtered)
             log.info(f"  VoxPopuli '{split}': {len(ss_filtered):,} muestras")
 
-    # ── Dataset sintético de respaldo ──────────────────────────────────────
+    # ── DAVE 1.0 ES ─────────────────────────────────────────────────────────
+    if "dave" in datasets:
+        dave = datasets["dave"]
+        log.info("Procesando DAVE 1.0 ES...")
+        for split in ("train", "validation", "test"):
+            ss = _hf_to_samples(dave, split, "dave1.0")
+            ss_filtered = [s for s in ss if _is_peninsular(s)]
+            all_samples.extend(ss_filtered)
+            corpus_texts.extend(s["sentence"] for s in ss_filtered)
+            log.info(f"  DAVE 1.0 '{split}': {len(ss_filtered):,} muestras")
+
     if not all_samples:
-        log.warning(
-            "No se encontraron datos reales. "
-            "Usando dataset sintético mínimo para verificar el pipeline."
-        )
-        phrases = [
-            "buenos días a todos vosotros",
-            "la distinción entre zeta y ese es característica del castellano",
-            "el parlamento aprobó la nueva ley con vosotros como protagonistas",
-            "la constitución española garantiza los derechos fundamentales",
-            "el ministerio de educación publicó el nuevo decreto",
-            "las comunidades autónomas gestionan sus propios presupuestos",
-        ]
-        sr = 16_000
-        for i in range(200):
-            all_samples.append({
-                "array": np.random.randn(sr * 3).astype(np.float32) * 0.05,
-                "sampling_rate": sr,
-                "sentence": phrases[i % len(phrases)],
-                "source": "synthetic",
-                "split": "train",
-            })
-        corpus_texts = phrases * 50
+        log.error("No se encontraron muestras reales en Common Voice, DAVE o VoxPopuli.")
+        sys.exit(1)
 
     # ── Split train/val ────────────────────────────────────────────────────
     random.shuffle(all_samples)
