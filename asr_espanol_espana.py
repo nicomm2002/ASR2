@@ -24,7 +24,7 @@ Ejecución:
   python asr_espanol_espana.py
 
 El script automatiza:
-  1. Carga de corpus Common Voice + DAVE + VoxPopuli (local)
+  1. Carga de corpus Common Voice (local)
   2. Filtrado de hablantes peninsulares
   3. Extracción de características de audio (Mel filterbank 80 filtros)
   4. Entrenamiento del tokenizer BPE (6000 tokens, español peninsular)
@@ -98,23 +98,13 @@ def _check_deps() -> None:
 
 
 def _verify_local_data() -> None:
-    """Verifica que los datos locales existan."""
+    """Verifica que los datos locales requeridos existan."""
     log.info("\n=== VERIFICACIÓN DE DATOS LOCALES ===")
     
     if not COMMON_VOICE_PATH.exists():
         log.error(f"✗ Common Voice NO encontrado en: {COMMON_VOICE_PATH}")
         sys.exit(1)
     log.info(f"✓ Common Voice encontrado en: {COMMON_VOICE_PATH}")
-
-    if not DAVE_PATH.exists():
-        log.error(f"✗ DAVE 1.0 NO encontrado en: {DAVE_PATH}")
-        sys.exit(1)
-    log.info(f"✓ DAVE 1.0 encontrado en: {DAVE_PATH}")
-    
-    if not VOXPOPULI_PATH.exists():
-        log.error(f"✗ VoxPopuli NO encontrado en: {VOXPOPULI_PATH}")
-        sys.exit(1)
-    log.info(f"✓ VoxPopuli encontrado en: {VOXPOPULI_PATH}")
 
 
 # ==============================================================================
@@ -1396,11 +1386,10 @@ def _load_voxpopuli_from_arrow(base_path: pathlib.Path) -> Optional[Any]:
 
 def load_local_datasets() -> Dict[str, Any]:
     """
-    Carga Common Voice ES, DAVE 1.0 ES y VoxPopuli ES desde rutas locales.
+    Carga únicamente Common Voice ES desde ruta local.
     
     Returns:
-        Dict con keys "common_voice", "dave" y "voxpopuli", cada uno conteniendo
-        un dataset de HuggingFace con splits train/validation/test
+        Dict con key "common_voice" y un dataset con splits train/validation/test
     """
     from datasets import load_from_disk
     
@@ -1436,52 +1425,8 @@ def load_local_datasets() -> Dict[str, Any]:
             except Exception as exc2:
                 log.error(f"No se pudo cargar Common Voice: {exc2}")
 
-    # ── DAVE 1.0 ────────────────────────────────────────────────────────────
-    log.info(f"Cargando DAVE 1.0 ES desde: {DAVE_PATH}")
-    try:
-        dave_dataset = load_from_disk(str(DAVE_PATH))
-        log.info(f"✓ DAVE 1.0 cargado con splits: {list(dave_dataset.keys())}")
-        datasets_loaded["dave"] = dave_dataset
-    except Exception as exc:
-        log.warning(f"No se pudo cargar DAVE 1.0 como dataset local: {exc}")
-        try:
-            dave_tree = _load_dave_from_folder_tree(DAVE_PATH)
-            if sum(len(v) for v in dave_tree.values()) > 0:
-                datasets_loaded["dave"] = dave_tree
-                log.info("✓ DAVE 1.0 cargado desde carpetas de audio/texto")
-            else:
-                log.error("No se encontraron pares válidos .txt + audio en DAVE 1.0")
-        except Exception as exc2:
-            log.error(f"No se pudo cargar DAVE 1.0 desde árbol de carpetas: {exc2}")
-    
-    # ── VoxPopuli ──────────────────────────────────────────────────────────
-    log.info(f"Cargando VoxPopuli ES desde: {VOXPOPULI_PATH}")
-    try:
-        vp_dataset = load_from_disk(str(VOXPOPULI_PATH))
-        log.info(f"✓ VoxPopuli cargado con splits: {list(vp_dataset.keys())}")
-        datasets_loaded["voxpopuli"] = vp_dataset
-    except Exception as exc:
-        log.warning(f"No se pudo cargar VoxPopuli como dataset local: {exc}")
-        vp_arrow = _load_voxpopuli_from_arrow(VOXPOPULI_PATH)
-        if vp_arrow is not None:
-            datasets_loaded["voxpopuli"] = vp_arrow
-            log.info("✓ VoxPopuli cargado desde shards .arrow locales")
-        # Intentar cargarlo desde HuggingFace cache
-        if "voxpopuli" not in datasets_loaded:
-            try:
-                from datasets import load_dataset
-                vp_dataset = load_dataset(
-                    "facebook/voxpopuli",
-                    "es",
-                    cache_dir=str(VOXPOPULI_PATH / "hf_cache"),
-                )
-                log.info(f"✓ VoxPopuli cargado desde HF cache con splits: {list(vp_dataset.keys())}")
-                datasets_loaded["voxpopuli"] = vp_dataset
-            except Exception as exc2:
-                log.error(f"No se pudo cargar VoxPopuli: {exc2}")
-    
     if not datasets_loaded:
-        log.error("No se pudo cargar ningún dataset local")
+        log.error("No se pudo cargar Common Voice")
         sys.exit(1)
     
     return datasets_loaded
@@ -1650,7 +1595,7 @@ def build_dataloaders(
 ) -> Tuple["DataLoader", "DataLoader", List[str]]:
     """
     Construye los DataLoaders de entrenamiento y validación usando
-    Common Voice ES + DAVE 1.0 ES + VoxPopuli ES desde rutas locales.
+    únicamente Common Voice ES desde rutas locales.
 
     Devuelve también la lista de textos del corpus para entrenar el tokenizer.
     """
@@ -1674,31 +1619,8 @@ def build_dataloaders(
             corpus_texts.extend(s["sentence"] for s in ss_filtered)
             log.info(f"  Common Voice '{split}': {len(ss_filtered):,} muestras peninsulares")
 
-    # ── VoxPopuli ES ───────────────────────────────────────────────────────
-    if "voxpopuli" in datasets:
-        vp = datasets["voxpopuli"]
-        log.info("Procesando VoxPopuli ES...")
-        for split in ("train", "validation", "test"):
-            ss = _to_samples(vp, split, "voxpopuli")
-            # VoxPopuli es principalmente de fuentes públicas españolas
-            ss_filtered = [s for s in ss if _is_peninsular(s)]
-            all_samples.extend(ss_filtered)
-            corpus_texts.extend(s["sentence"] for s in ss_filtered)
-            log.info(f"  VoxPopuli '{split}': {len(ss_filtered):,} muestras")
-
-    # ── DAVE 1.0 ES ─────────────────────────────────────────────────────────
-    if "dave" in datasets:
-        dave = datasets["dave"]
-        log.info("Procesando DAVE 1.0 ES...")
-        for split in ("train", "validation", "test"):
-            ss = _to_samples(dave, split, "dave1.0")
-            ss_filtered = [s for s in ss if _is_peninsular(s)]
-            all_samples.extend(ss_filtered)
-            corpus_texts.extend(s["sentence"] for s in ss_filtered)
-            log.info(f"  DAVE 1.0 '{split}': {len(ss_filtered):,} muestras")
-
     if not all_samples:
-        log.error("No se encontraron muestras reales en Common Voice, DAVE o VoxPopuli.")
+        log.error("No se encontraron muestras reales en Common Voice.")
         sys.exit(1)
 
     # ── Split train/val ────────────────────────────────────────────────────
