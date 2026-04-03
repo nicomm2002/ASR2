@@ -15,7 +15,7 @@ Arquitectura basada en:
   · Samba-ASR      (2025)
 
 Datos requeridos (locales):
-  /home/nmartinez-root/mi_entorno/data/common_voice_25/   (Common Voice ES)
+  /home/nmartinez-root/mi_entorno/data/common_voice_25/cv-corpus-25.0-2026-03-09/   (Common Voice ES)
   /home/nmartinez-root/mi_entorno/data/dave1.0/           (DAVE 1.0 ES)
   /home/nmartinez-root/mi_entorno/data/voxpopuli/         (VoxPopuli ES)
 
@@ -60,7 +60,7 @@ log = logging.getLogger("ASSR")
 
 # Rutas fijas de datos locales
 DATA_BASE = pathlib.Path("/home/nmartinez-root/mi_entorno/data")
-COMMON_VOICE_PATH = DATA_BASE / "common_voice_25"
+COMMON_VOICE_PATH = DATA_BASE / "common_voice_25" / "cv-corpus-25.0-2026-03-09"
 DAVE_PATH = DATA_BASE / "dave1.0"
 VOXPOPULI_PATH = DATA_BASE / "voxpopuli"
 
