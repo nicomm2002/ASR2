@@ -1269,6 +1269,21 @@ def _stable_split_from_id(sample_id: str) -> str:
 
 def _load_common_voice_from_tsv(base_path: pathlib.Path) -> Dict[str, List[Dict]]:
     """Carga Common Voice desde TSV locales (train/dev/test/validated)."""
+    # Common Voice suele venir como .../cv-corpus-xx/es/...
+    # Si los TSV no están en la raíz, resolver automáticamente subcarpeta de idioma.
+    if not (base_path / "train.tsv").exists() and not (base_path / "validated.tsv").exists():
+        lang_candidates = [base_path / "es", base_path / "es-ES"]
+        for cand in lang_candidates:
+            if (cand / "train.tsv").exists() or (cand / "validated.tsv").exists():
+                base_path = cand
+                break
+        else:
+            discovered = sorted(
+                p.parent for p in base_path.rglob("train.tsv") if p.is_file()
+            )
+            if discovered:
+                base_path = discovered[0]
+
     split_to_tsv = {
         "train": "train.tsv",
         "validation": "dev.tsv",
@@ -1415,7 +1430,6 @@ def load_local_datasets() -> Dict[str, Any]:
                     "mozilla-foundation/common_voice_16_0",
                     "es",
                     cache_dir=str(COMMON_VOICE_PATH / "hf_cache"),
-                    trust_remote_code=True,
                 )
                 log.info(f"✓ Common Voice cargado desde HF cache con splits: {list(cv_dataset.keys())}")
                 datasets_loaded["common_voice"] = cv_dataset
@@ -1460,7 +1474,6 @@ def load_local_datasets() -> Dict[str, Any]:
                     "facebook/voxpopuli",
                     "es",
                     cache_dir=str(VOXPOPULI_PATH / "hf_cache"),
-                    trust_remote_code=True,
                 )
                 log.info(f"✓ VoxPopuli cargado desde HF cache con splits: {list(vp_dataset.keys())}")
                 datasets_loaded["voxpopuli"] = vp_dataset
