@@ -16,8 +16,6 @@ Arquitectura basada en:
 
 Datos requeridos (locales):
   /home/nmartinez-root/mi_entorno/data/common_voice_25/cv-corpus-25.0-2026-03-09/   (Common Voice ES)
-  /home/nmartinez-root/mi_entorno/data/dave1.0/           (DAVE 1.0 ES)
-  /home/nmartinez-root/mi_entorno/data/voxpopuli/         (VoxPopuli ES)
 
 Ejecución:
   pip install -r requirements.txt
@@ -44,7 +42,6 @@ import json
 import time
 import random
 import csv
-import hashlib
 import logging
 import pathlib
 import unicodedata
@@ -63,8 +60,6 @@ log = logging.getLogger("ASSR")
 # Rutas fijas de datos locales
 DATA_BASE = pathlib.Path("/home/nmartinez-root/mi_entorno/data")
 COMMON_VOICE_PATH = DATA_BASE / "common_voice_25" / "cv-corpus-25.0-2026-03-09"
-DAVE_PATH = DATA_BASE / "dave1.0"
-VOXPOPULI_PATH = DATA_BASE / "voxpopuli"
 
 # ==============================================================================
 # VERIFICACIÓN DE DEPENDENCIAS
@@ -678,7 +673,7 @@ class SpanishBPETokenizer:
             log.warning(
                 f"Corpus pequeño ({total_chars:,} chars). "
                 f"Reduciendo vocab_size {self.vocab_size} → {effective_vocab}. "
-                f"Con el corpus real (Common Voice + VoxPopuli, >1M chars) "
+                f"Con el corpus real (Common Voice, >1M chars) "
                 f"se alcanzará vocab={self.vocab_size}."
             )
 
@@ -1246,17 +1241,6 @@ def _is_peninsular(sample: Dict) -> bool:
     return True
 
 
-def _stable_split_from_id(sample_id: str) -> str:
-    """Asigna split estable train/validation/test a partir de un id."""
-    h = hashlib.md5(sample_id.encode("utf-8")).hexdigest()
-    bucket = int(h[:8], 16) % 100
-    if bucket < 90:
-        return "train"
-    if bucket < 95:
-        return "validation"
-    return "test"
-
-
 def _load_common_voice_from_tsv(base_path: pathlib.Path) -> Dict[str, List[Dict]]:
     """Carga Common Voice desde TSV locales (train/dev/test/validated)."""
     # Common Voice suele venir como .../cv-corpus-xx/es/...
@@ -1317,73 +1301,6 @@ def _load_common_voice_from_tsv(base_path: pathlib.Path) -> Dict[str, List[Dict]
     return samples_by_split
 
 
-def _load_dave_from_folder_tree(base_path: pathlib.Path) -> Dict[str, List[Dict]]:
-    """Carga DAVE 1.0 desde carpetas con pares <id>.txt + <id>.<audio>."""
-    audio_exts = (".webm", ".wav", ".flac", ".mp3", ".ogg", ".m4a")
-    samples_by_split: Dict[str, List[Dict]] = {"train": [], "validation": [], "test": []}
-
-    es_root = None
-    for p in base_path.rglob("es-ES"):
-        if p.is_dir():
-            es_root = p
-            break
-    if es_root is None:
-        es_root = base_path
-
-    txt_files = [p for p in es_root.rglob("*.txt") if p.is_file()]
-    for txt_path in txt_files:
-        stem = txt_path.stem
-        text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
-        if not text:
-            continue
-        audio_path = None
-        for ext in audio_exts:
-            cand = txt_path.with_suffix(ext)
-            if cand.exists():
-                audio_path = cand
-                break
-        if audio_path is None:
-            continue
-        split = _stable_split_from_id(stem)
-        samples_by_split[split].append(
-            {
-                "audio": {"path": str(audio_path)},
-                "sentence": text,
-                "source": "dave1.0",
-                "split": split,
-            }
-        )
-
-    for split in ("train", "validation", "test"):
-        log.info(f"✓ DAVE folder '{split}': {len(samples_by_split[split]):,} muestras")
-    return samples_by_split
-
-
-def _load_voxpopuli_from_arrow(base_path: pathlib.Path) -> Optional[Any]:
-    """Carga VoxPopuli desde shards .arrow locales."""
-    arrow_files = sorted([p for p in base_path.rglob("*.arrow") if p.is_file()])
-    if not arrow_files:
-        return None
-    train_files = [str(p) for p in arrow_files if "train" in p.name.lower()]
-    val_files = [str(p) for p in arrow_files if ("validation" in p.name.lower() or "dev" in p.name.lower())]
-    test_files = [str(p) for p in arrow_files if "test" in p.name.lower()]
-    data_files: Dict[str, List[str]] = {}
-    if train_files:
-        data_files["train"] = train_files
-    if val_files:
-        data_files["validation"] = val_files
-    if test_files:
-        data_files["test"] = test_files
-    if not data_files:
-        data_files["train"] = [str(p) for p in arrow_files]
-    try:
-        from datasets import load_dataset
-        return load_dataset("arrow", data_files=data_files)
-    except Exception as exc:
-        log.error(f"No se pudo cargar VoxPopuli desde .arrow: {exc}")
-        return None
-
-
 def load_local_datasets() -> Dict[str, Any]:
     """
     Carga únicamente Common Voice ES desde ruta local.
@@ -1438,7 +1355,7 @@ def _hf_to_samples(hf_dataset: Any, split: str, source: str) -> List[Dict]:
     if hf_dataset is None or split not in hf_dataset:
         return samples
     for row in hf_dataset[split]:
-        # Common Voice/DAVE/VoxPopuli: posibles nombres de campo de texto.
+        # Common Voice: posibles nombres de campo de texto.
         # `accent` es opcional y puede no existir según el dataset/split.
         text = row.get("sentence") or row.get("raw_text") or row.get("text") or ""
         if not text.strip():
@@ -1480,7 +1397,7 @@ class SpanishASRDataset(torch.utils.data.Dataset):
     """
     Dataset PyTorch para ASR en español peninsular.
 
-    Compatible con Common Voice ES y VoxPopuli ES.
+    Compatible con Common Voice ES.
     Soporta speed perturbation: 0.9×, 1.0×, 1.1×.
     """
 
