@@ -1333,17 +1333,20 @@ def _hf_to_samples(hf_dataset: Any, split: str, source: str) -> List[Dict]:
     if hf_dataset is None or split not in hf_dataset:
         return samples
     for row in hf_dataset[split]:
-        # Common Voice/DAVE/VoxPopuli: posibles nombres de campo de texto
+        # Common Voice/DAVE/VoxPopuli: posibles nombres de campo de texto.
+        # `accent` es opcional y puede no existir según el dataset/split.
         text = row.get("sentence") or row.get("raw_text") or row.get("text") or ""
         if not text.strip():
             continue
-        samples.append({
+        sample = {
             "audio": row.get("audio", {}),
             "sentence": text,
-            "accent": row.get("accent", ""),
             "source": source,
             "split": split,
-        })
+        }
+        if "accent" in row:
+            sample["accent"] = row.get("accent") or ""
+        samples.append(sample)
     return samples
 
 
@@ -1380,6 +1383,14 @@ class SpanishASRDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[idx]
 
+        def _build_output(features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            text = sample.get("sentence") or sample.get("text") or ""
+            tokens = torch.tensor(
+                self.tokenizer.encode(text, add_sos=True, add_eos=True),
+                dtype=torch.long,
+            )
+            return features[: self.max_frames], tokens[: self.max_tokens]
+
         # ── Obtener waveform ──────────────────────────────────────────────
         waveform: Optional[np.ndarray] = None
         sr = 16_000
@@ -1392,26 +1403,23 @@ class SpanishASRDataset(torch.utils.data.Dataset):
             audio_path = pathlib.Path(audio_field["path"])
             if audio_path.exists():
                 features = self.frontend.process(str(audio_path))
-                text = sample.get("sentence") or sample.get("text") or ""
-                tokens = torch.tensor(
-                    self.tokenizer.encode(text, add_sos=True, add_eos=True),
-                    dtype=torch.long,
-                )
-                return features[: self.max_frames], tokens[: self.max_tokens]
+                return _build_output(features)
+            log.warning(f"Ruta de audio no existe: {audio_path}")
         elif sample.get("array") is not None:
             waveform = np.array(sample["array"], dtype=np.float32)
             sr = int(sample.get("sampling_rate", 16_000))
         elif sample.get("path") and pathlib.Path(sample["path"]).exists():
             features = self.frontend.process(sample["path"])
-            text = sample.get("sentence") or sample.get("text") or ""
-            tokens = torch.tensor(
-                self.tokenizer.encode(text, add_sos=True, add_eos=True),
-                dtype=torch.long,
-            )
-            return features[: self.max_frames], tokens[: self.max_tokens]
+            return _build_output(features)
 
         if waveform is None or len(waveform) == 0:
-            raise ValueError("No se pudo cargar audio real para la muestra.")
+            resolved_path = sample.get("path") or (sample.get("audio") or {}).get("path")
+            raise ValueError(
+                "No se pudo cargar audio real para la muestra "
+                f"(idx={idx}, source={sample.get('source', 'unknown')}, "
+                f"split={sample.get('split', 'unknown')}, "
+                f"path={resolved_path or 'path not available'})."
+            )
 
         # Speed perturbation
         if self.speed_perturbation and random.random() < 0.67:
@@ -1424,13 +1432,7 @@ class SpanishASRDataset(torch.utils.data.Dataset):
                 pass
 
         features = self.frontend.process_waveform(waveform, sr)
-
-        text = sample.get("sentence") or sample.get("text") or ""
-        tokens = torch.tensor(
-            self.tokenizer.encode(text, add_sos=True, add_eos=True),
-            dtype=torch.long,
-        )
-        return features[: self.max_frames], tokens[: self.max_tokens]
+        return _build_output(features)
 
     @staticmethod
     def collate_fn(
