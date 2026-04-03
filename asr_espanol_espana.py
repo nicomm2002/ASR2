@@ -43,6 +43,8 @@ import math
 import json
 import time
 import random
+import csv
+import hashlib
 import logging
 import pathlib
 import unicodedata
@@ -1254,6 +1256,129 @@ def _is_peninsular(sample: Dict) -> bool:
     return True
 
 
+def _stable_split_from_id(sample_id: str) -> str:
+    """Asigna split estable train/validation/test a partir de un id."""
+    h = hashlib.md5(sample_id.encode("utf-8")).hexdigest()
+    bucket = int(h[:8], 16) % 100
+    if bucket < 90:
+        return "train"
+    if bucket < 95:
+        return "validation"
+    return "test"
+
+
+def _load_common_voice_from_tsv(base_path: pathlib.Path) -> Dict[str, List[Dict]]:
+    """Carga Common Voice desde TSV locales (train/dev/test/validated)."""
+    split_to_tsv = {
+        "train": "train.tsv",
+        "validation": "dev.tsv",
+        "test": "test.tsv",
+    }
+    if not (base_path / "train.tsv").exists() and (base_path / "validated.tsv").exists():
+        split_to_tsv["train"] = "validated.tsv"
+
+    samples_by_split: Dict[str, List[Dict]] = {"train": [], "validation": [], "test": []}
+    clips_dir = base_path / "clips"
+
+    for split, tsv_name in split_to_tsv.items():
+        tsv_path = base_path / tsv_name
+        if not tsv_path.exists():
+            continue
+        with tsv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                text = (row.get("sentence") or row.get("transcript") or row.get("text") or "").strip()
+                if not text:
+                    continue
+                rel_audio = (row.get("path") or row.get("audio") or row.get("file") or "").strip()
+                if not rel_audio:
+                    continue
+                audio_path = pathlib.Path(rel_audio)
+                if not audio_path.is_absolute():
+                    cand1 = clips_dir / rel_audio
+                    cand2 = base_path / rel_audio
+                    audio_path = cand1 if cand1.exists() else cand2
+                sample = {
+                    "audio": {"path": str(audio_path)},
+                    "sentence": text,
+                    "source": "common_voice",
+                    "split": split,
+                }
+                accent = (row.get("accent") or "").strip()
+                if accent:
+                    sample["accent"] = accent
+                samples_by_split[split].append(sample)
+        log.info(f"✓ Common Voice TSV '{tsv_name}': {len(samples_by_split[split]):,} muestras")
+    return samples_by_split
+
+
+def _load_dave_from_folder_tree(base_path: pathlib.Path) -> Dict[str, List[Dict]]:
+    """Carga DAVE 1.0 desde carpetas con pares <id>.txt + <id>.<audio>."""
+    audio_exts = (".webm", ".wav", ".flac", ".mp3", ".ogg", ".m4a")
+    samples_by_split: Dict[str, List[Dict]] = {"train": [], "validation": [], "test": []}
+
+    es_root = None
+    for p in base_path.rglob("es-ES"):
+        if p.is_dir():
+            es_root = p
+            break
+    if es_root is None:
+        es_root = base_path
+
+    txt_files = [p for p in es_root.rglob("*.txt") if p.is_file()]
+    for txt_path in txt_files:
+        stem = txt_path.stem
+        text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            continue
+        audio_path = None
+        for ext in audio_exts:
+            cand = txt_path.with_suffix(ext)
+            if cand.exists():
+                audio_path = cand
+                break
+        if audio_path is None:
+            continue
+        split = _stable_split_from_id(stem)
+        samples_by_split[split].append(
+            {
+                "audio": {"path": str(audio_path)},
+                "sentence": text,
+                "source": "dave1.0",
+                "split": split,
+            }
+        )
+
+    for split in ("train", "validation", "test"):
+        log.info(f"✓ DAVE folder '{split}': {len(samples_by_split[split]):,} muestras")
+    return samples_by_split
+
+
+def _load_voxpopuli_from_arrow(base_path: pathlib.Path) -> Optional[Any]:
+    """Carga VoxPopuli desde shards .arrow locales."""
+    arrow_files = sorted([p for p in base_path.rglob("*.arrow") if p.is_file()])
+    if not arrow_files:
+        return None
+    train_files = [str(p) for p in arrow_files if "train" in p.name.lower()]
+    val_files = [str(p) for p in arrow_files if ("validation" in p.name.lower() or "dev" in p.name.lower())]
+    test_files = [str(p) for p in arrow_files if "test" in p.name.lower()]
+    data_files: Dict[str, List[str]] = {}
+    if train_files:
+        data_files["train"] = train_files
+    if val_files:
+        data_files["validation"] = val_files
+    if test_files:
+        data_files["test"] = test_files
+    if not data_files:
+        data_files["train"] = [str(p) for p in arrow_files]
+    try:
+        from datasets import load_dataset
+        return load_dataset("arrow", data_files=data_files)
+    except Exception as exc:
+        log.error(f"No se pudo cargar VoxPopuli desde .arrow: {exc}")
+        return None
+
+
 def load_local_datasets() -> Dict[str, Any]:
     """
     Carga Common Voice ES, DAVE 1.0 ES y VoxPopuli ES desde rutas locales.
@@ -1275,19 +1400,27 @@ def load_local_datasets() -> Dict[str, Any]:
         datasets_loaded["common_voice"] = cv_dataset
     except Exception as exc:
         log.warning(f"No se pudo cargar Common Voice como dataset local: {exc}")
-        # Intentar cargarlo desde HuggingFace cache
         try:
-            from datasets import load_dataset
-            cv_dataset = load_dataset(
-                "mozilla-foundation/common_voice_16_0",
-                "es",
-                cache_dir=str(COMMON_VOICE_PATH / "hf_cache"),
-                trust_remote_code=True,
-            )
-            log.info(f"✓ Common Voice cargado desde HF cache con splits: {list(cv_dataset.keys())}")
-            datasets_loaded["common_voice"] = cv_dataset
-        except Exception as exc2:
-            log.error(f"No se pudo cargar Common Voice: {exc2}")
+            cv_tsv = _load_common_voice_from_tsv(COMMON_VOICE_PATH)
+            if sum(len(v) for v in cv_tsv.values()) > 0:
+                datasets_loaded["common_voice"] = cv_tsv
+                log.info("✓ Common Voice cargado desde TSV locales")
+        except Exception as exc_tsv:
+            log.warning(f"No se pudo cargar Common Voice desde TSV: {exc_tsv}")
+        # Intentar cargarlo desde HuggingFace cache
+        if "common_voice" not in datasets_loaded:
+            try:
+                from datasets import load_dataset
+                cv_dataset = load_dataset(
+                    "mozilla-foundation/common_voice_16_0",
+                    "es",
+                    cache_dir=str(COMMON_VOICE_PATH / "hf_cache"),
+                    trust_remote_code=True,
+                )
+                log.info(f"✓ Common Voice cargado desde HF cache con splits: {list(cv_dataset.keys())}")
+                datasets_loaded["common_voice"] = cv_dataset
+            except Exception as exc2:
+                log.error(f"No se pudo cargar Common Voice: {exc2}")
 
     # ── DAVE 1.0 ────────────────────────────────────────────────────────────
     log.info(f"Cargando DAVE 1.0 ES desde: {DAVE_PATH}")
@@ -1296,7 +1429,16 @@ def load_local_datasets() -> Dict[str, Any]:
         log.info(f"✓ DAVE 1.0 cargado con splits: {list(dave_dataset.keys())}")
         datasets_loaded["dave"] = dave_dataset
     except Exception as exc:
-        log.error(f"No se pudo cargar DAVE 1.0: {exc}")
+        log.warning(f"No se pudo cargar DAVE 1.0 como dataset local: {exc}")
+        try:
+            dave_tree = _load_dave_from_folder_tree(DAVE_PATH)
+            if sum(len(v) for v in dave_tree.values()) > 0:
+                datasets_loaded["dave"] = dave_tree
+                log.info("✓ DAVE 1.0 cargado desde carpetas de audio/texto")
+            else:
+                log.error("No se encontraron pares válidos .txt + audio en DAVE 1.0")
+        except Exception as exc2:
+            log.error(f"No se pudo cargar DAVE 1.0 desde árbol de carpetas: {exc2}")
     
     # ── VoxPopuli ──────────────────────────────────────────────────────────
     log.info(f"Cargando VoxPopuli ES desde: {VOXPOPULI_PATH}")
@@ -1306,19 +1448,24 @@ def load_local_datasets() -> Dict[str, Any]:
         datasets_loaded["voxpopuli"] = vp_dataset
     except Exception as exc:
         log.warning(f"No se pudo cargar VoxPopuli como dataset local: {exc}")
+        vp_arrow = _load_voxpopuli_from_arrow(VOXPOPULI_PATH)
+        if vp_arrow is not None:
+            datasets_loaded["voxpopuli"] = vp_arrow
+            log.info("✓ VoxPopuli cargado desde shards .arrow locales")
         # Intentar cargarlo desde HuggingFace cache
-        try:
-            from datasets import load_dataset
-            vp_dataset = load_dataset(
-                "facebook/voxpopuli",
-                "es",
-                cache_dir=str(VOXPOPULI_PATH / "hf_cache"),
-                trust_remote_code=True,
-            )
-            log.info(f"✓ VoxPopuli cargado desde HF cache con splits: {list(vp_dataset.keys())}")
-            datasets_loaded["voxpopuli"] = vp_dataset
-        except Exception as exc2:
-            log.error(f"No se pudo cargar VoxPopuli: {exc2}")
+        if "voxpopuli" not in datasets_loaded:
+            try:
+                from datasets import load_dataset
+                vp_dataset = load_dataset(
+                    "facebook/voxpopuli",
+                    "es",
+                    cache_dir=str(VOXPOPULI_PATH / "hf_cache"),
+                    trust_remote_code=True,
+                )
+                log.info(f"✓ VoxPopuli cargado desde HF cache con splits: {list(vp_dataset.keys())}")
+                datasets_loaded["voxpopuli"] = vp_dataset
+            except Exception as exc2:
+                log.error(f"No se pudo cargar VoxPopuli: {exc2}")
     
     if not datasets_loaded:
         log.error("No se pudo cargar ningún dataset local")
@@ -1348,6 +1495,27 @@ def _hf_to_samples(hf_dataset: Any, split: str, source: str) -> List[Dict]:
             sample["accent"] = row.get("accent") or ""
         samples.append(sample)
     return samples
+
+
+def _to_samples(data: Any, split: str, source: str) -> List[Dict]:
+    """Convierte un origen de datos (HF o dict local) a muestras homogéneas."""
+    if isinstance(data, dict) and split in data and isinstance(data[split], list):
+        out: List[Dict] = []
+        for row in data[split]:
+            text = (row.get("sentence") or row.get("raw_text") or row.get("text") or "").strip()
+            if not text:
+                continue
+            sample = {
+                "audio": row.get("audio", {}),
+                "sentence": text,
+                "source": row.get("source", source),
+                "split": row.get("split", split),
+            }
+            if "accent" in row:
+                sample["accent"] = row.get("accent") or ""
+            out.append(sample)
+        return out
+    return _hf_to_samples(data, split, source)
 
 
 class SpanishASRDataset(torch.utils.data.Dataset):
@@ -1486,7 +1654,7 @@ def build_dataloaders(
         cv = datasets["common_voice"]
         log.info("Procesando Common Voice ES...")
         for split in ("train", "validation", "test"):
-            ss = _hf_to_samples(cv, split, "common_voice")
+            ss = _to_samples(cv, split, "common_voice")
             # Filtrar solo hablantes peninsulares
             ss_filtered = [s for s in ss if _is_peninsular(s)]
             all_samples.extend(ss_filtered)
@@ -1498,7 +1666,7 @@ def build_dataloaders(
         vp = datasets["voxpopuli"]
         log.info("Procesando VoxPopuli ES...")
         for split in ("train", "validation", "test"):
-            ss = _hf_to_samples(vp, split, "voxpopuli")
+            ss = _to_samples(vp, split, "voxpopuli")
             # VoxPopuli es principalmente de fuentes públicas españolas
             ss_filtered = [s for s in ss if _is_peninsular(s)]
             all_samples.extend(ss_filtered)
@@ -1510,7 +1678,7 @@ def build_dataloaders(
         dave = datasets["dave"]
         log.info("Procesando DAVE 1.0 ES...")
         for split in ("train", "validation", "test"):
-            ss = _hf_to_samples(dave, split, "dave1.0")
+            ss = _to_samples(dave, split, "dave1.0")
             ss_filtered = [s for s in ss if _is_peninsular(s)]
             all_samples.extend(ss_filtered)
             corpus_texts.extend(s["sentence"] for s in ss_filtered)
